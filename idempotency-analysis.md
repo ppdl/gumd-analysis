@@ -1,8 +1,8 @@
 # useradd.d 스크립트 멱등성 분석
 
 ## 개요
-/etc/gumd/useradd.d의 스크립트가 여러번 반복해서 수행되어도 동일한 결과를 도출하는지(멱등성) 조사
-MIC단계에서 한번 수행되고, 첫부팅 시 platform-extension migration script에 의해 다시한번 실행될 경우 부작용 없는지 검토
+- /etc/gumd/useradd.d의 스크립트가 여러번 반복해서 수행되어도 동일한 결과를 도출하는지(멱등성) 조사
+- MIC단계에서 한번 수행되고, 첫부팅 시 platform-extension migration script에 의해 다시한번 실행될 경우 부작용 없는지 검토
 
 ## 분석 대상
 
