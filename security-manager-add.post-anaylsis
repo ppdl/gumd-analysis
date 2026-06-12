@@ -1,0 +1,165 @@
+# Crash/Re-run Safety Analysis: `50_security-manager-add.post`
+
+## Scope
+
+Analysis of whether the work performed by `50_security-manager-add.post` recovers
+correctly when the script is interrupted mid-execution (e.g. by a poweroff) and later
+re-run. Includes verification of the underlying Cynara database write atomicity in
+`libcynara-commons`.
+
+---
+
+## 1. What the script does
+
+`src/cmd/50_security-manager-add.post` is a single line:
+
+```sh
+security-manager-cmd --manage-users=add --uid=$2 --usertype=$5
+```
+
+gumd/useradd invokes it on user creation with `$2`=uid, `$5`=usertype. The real work
+lives inside `security-manager-cmd`:
+
+```
+security-manager-cmd --manage-users=add
+  -> manageUserOperation("add")                 [security-manager-cmd.cpp:573]
+  -> security_manager_user_add()                [client-security-manager.cpp:1683]
+  -> (offline mode) ServiceImpl::userAdd()      [service_impl.cpp:1538]
+```
+
+When the daemon is not running, `security-manager-cmd` takes a `ServiceFileLock` and runs
+in **offline mode**, calling `ServiceImpl::userAdd` directly
+(`client-offline.cpp:46-60`). This lock guards against concurrent access with a running
+daemon; it is **not** a crash-recovery marker.
+
+`ServiceImpl::userAdd` performs **three independent persistent mutations**:
+
+| # | Operation | Target | Code |
+|---|-----------|--------|------|
+| 1 | `m_cynaraAdmin.userInit(uid, type)` — set one user->usertype-bucket policy in MAIN bucket | Cynara DB | `service_impl.cpp:1545` / `cynara.cpp:485` |
+| 2 | Collect privacy/blacklist policies of global apps, then `setPolicies(policies)` as a batch | Cynara DB | `service_impl.cpp:1546-1621` |
+| 3 | `initializeUserPermissibleFile(uid)` — create empty permissible file (when not sandboxing) | Filesystem | `service_impl.cpp:1623-1625` / `permissible-set.cpp:290` |
+
+---
+
+## 2. Interruption / re-run recovery
+
+**Conclusion:** All three operations are individually idempotent. As long as the `.post`
+script is re-run from the start, the complete and correct state is reconstructed
+regardless of where the interruption happened. However, the whole `userAdd` is **not**
+wrapped in a single transaction, and security-manager itself has **no logic that
+guarantees the re-run or that detects/self-heals an incomplete state**.
+
+### Idempotency of each step
+
+- **Steps 1 & 2 (Cynara):** Both go through `cynara_admin_set_policies`
+  (`cynara.cpp:309`), which has set/upsert semantics — re-applying the same policy yields
+  the same result. `userAdd` has **no "user already exists" guard** (`userInit` is a plain
+  set), so re-running does not fail with an "already exists" error. **Safe.**
+
+- **Step 3 (permissible file):** `initializeUserPermissibleFile`
+  - tolerates `errno == EEXIST` on `mkdir` (`permissible-set.cpp:295`) — safe on repeat
+  - opens an `ofstream` (**truncate to empty**) -> writes labels -> finally `fchmod 0444`
+    to mark valid
+  - `verifyFileIntegrity` always treats a **zero-size file as valid**
+    (`permissible-set.cpp:150-153`). So even a crash just before the chmod leaves a valid
+    empty file; a re-run truncates and rewrites to the same result. **Safe.**
+
+### Per-interruption-point scenarios (assuming the script is re-run)
+
+- Interrupted between 1 and 2 -> re-run does 1 (idempotent) + 2 re-sets the full policy
+  set -> fully recovered
+- Interrupted between 2 and 3 -> re-run: 1 & 2 idempotent, 3 freshly created -> fully
+  recovered
+- Interrupted during 3 -> empty/partial file is valid; re-run truncates and rewrites ->
+  fully recovered
+
+---
+
+## 3. Cynara DB write atomicity (`libcynara-commons`)
+
+The concern previously left as an "out-of-scope dependency" (whether a poweroff can
+corrupt the Cynara DB mid-write) is **fully addressed by libcynara-commons**.
+
+In the offline path, `cynara_admin_set_policies` **commits to disk synchronously before
+returning**, and that commit is crash-atomic via a guard-file two-phase protocol plus
+fsync. No torn write or partial state is ever left on disk.
+
+### Call path (synchronous persistence)
+
+```
+cynara_admin_set_policies()                         admin-api.cpp:109
+  -> impl->setPolicies(insertOrUpdate, remove)
+  -> OfflineLogic::setPolicies()                     OfflineLogic.cpp:97
+       m_storage->insertPolicies()/deletePolicies()  (in-memory)
+       onPoliciesChanged() -> m_storage->save()      OfflineLogic.cpp:105,291
+  -> CYNARA_API_SUCCESS                               returned only after save() completes
+```
+
+So by the time security-manager receives success from `set_policies`, the change is
+already durably committed. (Despite the name `InMemoryStorageBackend`, every change is
+flushed to disk through `save()`.)
+
+### Crash-consistency protocol (`InMemoryStorageBackend::save`, `Integrity.cpp`)
+
+Order of `save()` (`InMemoryStorageBackend.cpp:121`):
+
+```
+1. saveBackup() / dumpDatabase()  -> write all buckets, index, checksum to *.backup files (with checksums)
+2. syncDatabase(backup=true)      -> fsync all *.backup files + the directory
+3. createBackupGuard()            -> atomically create guard via O_CREAT|O_EXCL + fsync + dir fsync   <-- COMMIT POINT
+4. revalidatePrimaryDatabase()    -> promote backup->primary via hardlinks, fsync primary,
+                                      delete guard (+dir fsync), clean up backups
+```
+
+Recovery decision (`load()`, `InMemoryStorageBackend.cpp:66`) is driven by **guard file
+existence**:
+
+- guard absent -> load from primary
+- guard present -> primary write was interrupted -> **load from `*.backup`**, then
+  `postLoadCleanup` calls `revalidatePrimaryDatabase` again to **roll the interrupted
+  commit forward to completion** (`InMemoryStorageBackend.cpp:297-300`)
+
+### Per-poweroff-point analysis — all safe
+
+| Interruption point | Guard state | load() behavior | Result |
+|---|---|---|---|
+| 1-2 (writing/syncing backups) | absent | load primary | **old state** (primary untouched) |
+| 3 (around guard creation) | absent/present | absent->primary, present->backup (fully synced in step 2) | old or **new state** |
+| 4 (promoting to primary) | present | load backup, then finish promotion | **new state** (backup authoritative even if primary half-linked) |
+| end of 4 (after guard delete) | absent | load primary (complete) | **new state**; leftover `*.backup` cleaned by `deleteNonIndexedFiles` |
+
+Whatever point it is cut at, the DB converges to either the **complete old state** or the
+**complete new state** — never an intermediate/corrupted one. Additionally:
+
+- **Directory fsync is performed** — the code acknowledges (comment `Integrity.cpp:168-171`)
+  that `fsync` does not guarantee the directory entry reaches disk, and compensates with
+  `syncDirectory`, so hardlink creation and guard deletion are durable.
+- **Checksum validation** — on load, `m_checksum.compare()`
+  (`InMemoryStorageBackend.cpp:268`) verifies each file's integrity and raises
+  `DatabaseCorruptedException` on mismatch, catching torn writes independently of the
+  guard logic.
+- A separate `EmergencyBackup` mechanism also exists as an extra safety net against DB
+  corruption.
+
+---
+
+## 4. Summary
+
+- Each of the two Cynara writes (`userInit`, `setPolicies`) is **individually atomic and
+  durable** — a poweroff cannot corrupt the Cynara DB.
+- The overall `userAdd` is still non-atomic (three commit points), but because **each step
+  is idempotent** and **each Cynara commit is crash-consistent**, simply re-running the
+  `.post` script converges to the correct final state from any interruption point.
+- The only remaining real risk is **whether gumd actually re-runs `.post` for an
+  interrupted user-add** — this is outside the scope of security-manager and
+  libcynara-commons. security-manager has no self-healing logic that detects "user exists
+  in passwd but Cynara/permissible state is incomplete."
+
+### Notes / observations
+
+- Recovery correctness depends entirely on the re-run happening; there is no completion
+  marker or journal at the security-manager level to detect a partially-applied
+  `userAdd`.
+- Cynara's own DB persistence is robust; the weakest link in the chain is the external
+  re-run guarantee from gumd, not the data-layer atomicity.
